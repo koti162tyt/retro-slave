@@ -1,18 +1,12 @@
 """
 Админка ретранслятора Token Harbor + статус-страница.
-Супервизор запускает relay.py как дочерний процесс (127.0.0.1:$RELAY_PORT),
-проксирует /v1/* через него, ведёт учёт в status_registry.
-UI (title/theme/accent/секции/тексты/футер) читается из conf.yaml на каждый запрос.
-Роли — из env-переменных ADMIN_TOKEN_OWNER/ADMIN_TOKEN_ADMIN/ADMIN_TOKEN_JUNIOR.
+Прокси /v1/* работает прямо внутри Flask.
 """
-
 import urllib.request
 import urllib.error
 import html as html_escape
 import os
 import signal
-import socket
-import subprocess
 import sys
 import threading
 import time
@@ -27,7 +21,6 @@ from status_registry import (
     mark_started,
     mark_recovered,
     mark_unresponsive,
-    mark_clean_exit,
     mark_crashed,
     mark_permanently_failed,
     append_log,
@@ -41,19 +34,14 @@ try:
 except ImportError:
     waitress_serve = None
 
-
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
 PORT = int(os.getenv("PORT", 8080))
 CONF_FILE = Path("conf.yaml")
 
-RELAY_FILE = "relay.py"
-RELAY_HOST = "127.0.0.1"
-RELAY_PORT = int(os.getenv("RELAY_PORT", 8888))
-RELAY_URL = f"http://{RELAY_HOST}:{RELAY_PORT}"
-RELAY_READY_TIMEOUT = 60.0
-RELAY_READY_WAIT_FOR_CLIENT = 15.0
+TOKENHARBOR_BASE = "https://tokenharbor.ai"
+TOKENHARBOR_API_KEY = os.getenv("TOKENHARBOR_API_KEY", "").strip()
 
 SERVICE_INDEX = 0
 SERVICE_KEY = "token-harbor-relay"
@@ -61,22 +49,17 @@ SERVICE_NAME = "Token Harbor Relay"
 SERVICE_DESCRIPTION = "OpenAI-совместимый ретранслятор для Token Harbor"
 
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
-PING_INTERVAL = 600  # 10 минут
+PING_INTERVAL = 600
 
 app = Flask(__name__)
-
 _stop = threading.Event()
-_relay_proc: subprocess.Popen | None = None
-_relay_ready = threading.Event()
-_supervisor_started = False
-
 
 # ============================================================
 # РОЛИ И ПРАВА
 # ============================================================
 ROLE_PERMISSIONS = {
-    "owner": frozenset({"view", "view_logs", "restart_relay", "restart_all"}),
-    "admin": frozenset({"view", "view_logs", "restart_relay"}),
+    "owner": frozenset({"view", "view_logs", "restart_all"}),
+    "admin": frozenset({"view", "view_logs"}),
     "junior": frozenset({"view"}),
 }
 
@@ -87,7 +70,6 @@ ENV_TO_ROLE = {
     "ADMIN_TOKEN": "owner",
 }
 
-
 def _load_admins() -> dict:
     result = {}
     for env_name, role in ENV_TO_ROLE.items():
@@ -97,13 +79,11 @@ def _load_admins() -> dict:
         result[token] = role
     return result
 
-
 def _get_role() -> str | None:
     token = request.cookies.get("admin_token") or request.args.get("token")
     if not token:
         return None
     return _load_admins().get(token)
-
 
 def _has_perm(perm: str) -> bool:
     role = _get_role()
@@ -111,34 +91,24 @@ def _has_perm(perm: str) -> bool:
         return False
     return perm in ROLE_PERMISSIONS.get(role, frozenset())
 
-
 # ============================================================
-# UI-КОНФИГ ИЗ YAML
+# UI-КОНФИГ
 # ============================================================
 UI_DEFAULTS = {
     "title": "Token Harbor Relay",
     "subtitle": "Админка и статус ретранслятора",
     "theme": "dark",
     "accent_color": "#f63b3b",
-    "sections": {
-        "status": True,
-        "controls": True,
-        "footer": True,
-    },
+    "sections": {"status": True, "controls": True, "footer": True},
     "labels": {
         "controls_heading": "⚙️ Управление",
-        "restart_relay": "🔄 Перезапустить ретранслятор",
         "hard_restart": "☠️ Жёсткий рестарт",
         "login_heading": "🔐 Вход",
         "login_hint": "Введи токен доступа",
         "login_button": "Войти",
     },
-    "footer": {
-        "copyright": "",
-        "links": [],
-    },
+    "footer": {"copyright": "", "links": []},
 }
-
 
 def _load_ui() -> dict:
     ui = {
@@ -155,8 +125,7 @@ def _load_ui() -> dict:
     try:
         with CONF_FILE.open("r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-    except (FileNotFoundError, yaml.YAMLError) as e:
-        print(f"[ui] conf.yaml не прочитан: {e} — беру дефолты", flush=True)
+    except (FileNotFoundError, yaml.YAMLError):
         return ui
 
     src = cfg.get("ui") or {}
@@ -185,9 +154,7 @@ def _load_ui() -> dict:
                 lk for lk in src["footer"]["links"]
                 if isinstance(lk, dict) and lk.get("label") and lk.get("url")
             ]
-
     return ui
-
 
 def _hex_shift(hex_color: str, delta: int) -> str:
     h = hex_color.lstrip("#")
@@ -202,13 +169,8 @@ def _hex_shift(hex_color: str, delta: int) -> str:
     b = max(0, min(255, b + delta))
     return f"#{r:02x}{g:02x}{b:02x}"
 
-
-# ============================================================
-# SELF-PING
-# ============================================================
 def _self_ping():
     if not SELF_URL:
-        print("[ping] RENDER_EXTERNAL_URL/SELF_URL не задан — self-ping выключен", flush=True)
         return
     url = SELF_URL.rstrip("/") + "/health"
     print(f"[ping] старт: {url} каждые {PING_INTERVAL}s", flush=True)
@@ -219,118 +181,8 @@ def _self_ping():
             req = urllib.request.Request(url, headers={"User-Agent": "relay-self-ping"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 print(f"[ping] {url} → {resp.status}", flush=True)
-        except urllib.error.HTTPError as e:
-            print(f"[ping] {url} → HTTP {e.code}", flush=True)
         except Exception as e:
             print(f"[ping] {url} → ошибка: {e}", flush=True)
-
-
-# ============================================================
-# СУПЕРВИЗОР relay.py
-# ============================================================
-def _wait_relay_ready(timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and not _stop.is_set():
-        try:
-            # Используем socket вместо requests, чтобы обойти прокси Render
-            with socket.create_connection((RELAY_HOST, RELAY_PORT), timeout=1.0):
-                return True
-        except (socket.error, ConnectionRefusedError):
-            pass
-        _stop.wait(0.3)
-    return False
-
-
-def _drain_relay_stdout(proc: subprocess.Popen) -> None:
-    print("[supervisor] started draining relay stdout", flush=True)
-    try:
-        for line in iter(proc.stdout.readline, ""):
-            line = line.rstrip("\n")
-            print(f"[relay] {line}", flush=True)
-            append_log(SERVICE_INDEX, "stdout", line)
-    except Exception as exc:
-        print(f"[supervisor] ошибка чтения stdout relay: {exc}", flush=True)
-    print("[supervisor] stopped draining relay stdout", flush=True)
-
-
-def _supervise_relay():
-    global _relay_proc
-    restarts = 0
-    while not _stop.is_set():
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-u", RELAY_FILE],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except OSError as exc:
-            print(f"[supervisor] не смог запустить {RELAY_FILE}: {exc}", flush=True)
-            mark_permanently_failed(SERVICE_INDEX, 1)
-            return
-
-        _relay_proc = proc
-        _relay_ready.clear()
-        mark_started(SERVICE_INDEX)
-        print(f"[supervisor] {RELAY_FILE} запущен (PID {proc.pid})", flush=True)
-
-        threading.Thread(target=_drain_relay_stdout, args=(proc,), daemon=True).start()
-
-        # Даем процессу 3 секунды на инициализацию
-        time.sleep(3)
-        
-        # Если процесс уже умер — читаем остатки и выводим код возврата
-        if proc.poll() is not None:
-            print(f"[supervisor] ВНИМАНИЕ: relay.py упал сразу после старта (код {proc.returncode})", flush=True)
-            try:
-                remaining = proc.stdout.read()
-                if remaining:
-                    print(f"[relay-dead] {remaining}", flush=True)
-            except Exception as e:
-                print(f"[supervisor] не смог прочитать stdout: {e}", flush=True)
-            mark_permanently_failed(SERVICE_INDEX, proc.returncode or 1)
-            return
-
-        # Ждем готовности
-        if _wait_relay_ready(RELAY_READY_TIMEOUT):
-            _relay_ready.set()
-            mark_recovered(SERVICE_INDEX)
-            print("[supervisor] relay готов принимать запросы", flush=True)
-        else:
-            print("[supervisor] relay не поднялся за отведённое время", flush=True)
-            if proc.poll() is None:
-                print("[supervisor] процесс жив, но не отвечает на TCP. Убиваем.", flush=True)
-                proc.terminate()
-            mark_unresponsive(SERVICE_INDEX)
-
-        proc.wait()
-        _relay_proc = None
-        _relay_ready.clear()
-
-        if _stop.is_set():
-            return
-
-        code = proc.returncode
-        if code == 0:
-            mark_clean_exit(SERVICE_INDEX)
-            return
-
-        restarts += 1
-        mark_crashed(SERVICE_INDEX, code, will_restart=True)
-        print(f"[supervisor] relay упал (код {code}), рестарт #{restarts}", flush=True)
-
-        if _stop.wait(3.0):
-            return
-
-
-def _ensure_supervisor_started() -> None:
-    global _supervisor_started
-    if _supervisor_started:
-        return
-    _supervisor_started = True
-    threading.Thread(target=_supervise_relay, daemon=True).start()
-
 
 # ============================================================
 # HTML
@@ -340,7 +192,7 @@ def _build_admin_html() -> str:
     l = ui["labels"]
     sections = dict(ui["sections"])
 
-    if not (_has_perm("restart_relay") or _has_perm("restart_all")):
+    if not _has_perm("restart_all"):
         sections["controls"] = False
 
     role = _get_role() or "?"
@@ -362,10 +214,6 @@ def _build_admin_html() -> str:
         parts.append(f"""
         <h2 style="font-size:1.5em;margin-bottom:20px;font-weight:700;">{html_escape.escape(l['controls_heading'])}</h2>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:30px;">
-          <button type="button" onclick="if(confirm('Перезапустить ретранслятор?'))adminPost('/restart-relay')"
-                  style="padding:10px 20px;border-radius:8px;border:none;background:var(--primary-color);color:white;cursor:pointer;font-weight:600;">
-            {html_escape.escape(l['restart_relay'])}
-          </button>
           <button type="button" onclick="if(confirm('Жёсткий рестарт? Render поднимет контейнер заново.'))adminPost('/restart-all')"
                   style="padding:10px 20px;border-radius:8px;border:none;background:var(--danger-color);color:white;cursor:pointer;font-weight:600;">
             {html_escape.escape(l['hard_restart'])}
@@ -378,36 +226,23 @@ def _build_admin_html() -> str:
         admin_section = (
             '<section class="admin-section" '
             'style="margin-top:50px;padding-top:30px;border-top:2px solid var(--border-color);">'
-            + role_badge
-            + "".join(parts)
+            + role_badge + "".join(parts)
             + '<script>async function adminPost(url){const r=await fetch(url,{method:"POST"});'
               'const j=await r.json();alert(JSON.stringify(j));}</script>'
             + "</section>"
         )
 
     html = STATUS_HTML_TEMPLATE
-
     accent = ui["accent_color"]
     accent_dark = _hex_shift(accent, -16)
-
     theme = ui["theme"] if ui["theme"] in ("dark", "light", "auto") else "dark"
     theme_attr = "" if theme == "auto" else f' data-theme="{theme}"'
     color_scheme = "light dark" if theme == "auto" else theme
-
     override_css = f":root {{ --primary-color: {accent}; --primary-dark: {accent_dark}; }}"
 
-    html = html.replace(
-        '<link rel="stylesheet" href="__STAYPRESENT_CSS_URL__" />',
-        f"<style>{STATUS_CSS}</style><style>{override_css}</style>",
-    )
-    html = html.replace(
-        '<script src="__STAYPRESENT_JS_URL__"></script>',
-        f"<script>{STATUS_JS}</script>",
-    )
-    html = html.replace(
-        '<link rel="icon" href="__STAYPRESENT_FAVICON_URL__" id="favicon">',
-        '<link rel="icon" href="data:," id="favicon">',
-    )
+    html = html.replace('<link rel="stylesheet" href="__STAYPRESENT_CSS_URL__" />', f"<style>{STATUS_CSS}</style><style>{override_css}</style>")
+    html = html.replace('<script src="__STAYPRESENT_JS_URL__"></script>', f"<script>{STATUS_JS}</script>")
+    html = html.replace('<link rel="icon" href="__STAYPRESENT_FAVICON_URL__" id="favicon">', '<link rel="icon" href="data:," id="favicon">')
 
     html = html.replace("__STAYPRESENT_TITLE__", html_escape.escape(ui["title"]))
     html = html.replace("__STAYPRESENT_DESCRIPTION__", html_escape.escape(ui["subtitle"]))
@@ -421,11 +256,7 @@ def _build_admin_html() -> str:
         copyright_block = f'<p>{html_escape.escape(copyright_text)}</p>' if copyright_text else ""
         links = ui["footer"].get("links") or []
         if links:
-            link_html = " | ".join(
-                f'<a href="{html_escape.escape(lk["url"], quote=True)}">'
-                f'{html_escape.escape(lk["label"])}</a>'
-                for lk in links
-            )
+            link_html = " | ".join(f'<a href="{html_escape.escape(lk["url"], quote=True)}">{html_escape.escape(lk["label"])}</a>' for lk in links)
             links_block = f'<div class="footer-links">{link_html}</div>'
         else:
             links_block = ""
@@ -438,16 +269,7 @@ def _build_admin_html() -> str:
     html = html.replace("__STAYPRESENT_FOOTER_LINKS_BLOCK__", links_block)
 
     if not sections.get("status"):
-        hide_css = (
-            "<style>"
-            "body > .container > header,"
-            "body > .container > .status-summary,"
-            "body > .container > .services,"
-            "body > .container > .incidents,"
-            "body > .container > .metrics"
-            "{display:none !important;}"
-            "</style>"
-        )
+        hide_css = "<style>body > .container > header,body > .container > .status-summary,body > .container > .services,body > .container > .incidents,body > .container > .metrics{display:none !important;}</style>"
         html = html.replace("</head>", hide_css + "</head>")
 
     if admin_section:
@@ -455,71 +277,32 @@ def _build_admin_html() -> str:
 
     return html
 
-
 def _login_page(err: str = "") -> str:
     ui = _load_ui()
     l = ui["labels"]
     accent = ui["accent_color"]
     theme = ui["theme"] if ui["theme"] in ("dark", "light", "auto") else "dark"
-
-    if theme == "light":
-        bg, card, line, text, muted, input_bg = "#f8fafc", "#ffffff", "#e2e8f0", "#0f172a", "#64748b", "#f1f5f9"
-    else:
-        bg, card, line, text, muted, input_bg = "#0b1220", "#16202f", "#2d3b4e", "#e6edf3", "#94a3b8", "#0b1220"
-
+    bg, card, line, text, muted, input_bg = ("#f8fafc", "#ffffff", "#e2e8f0", "#0f172a", "#64748b", "#f1f5f9") if theme == "light" else ("#0b1220", "#16202f", "#2d3b4e", "#e6edf3", "#94a3b8", "#0b1220")
     e = f'<p style="color:#f87171;margin:0 0 1rem">{html_escape.escape(err)}</p>' if err else ""
 
-    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html_escape.escape(ui['title'])}</title>
-<style>
-  body{{background:{bg};color:{text};font-family:-apple-system,sans-serif;
-        display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}}
-  .box{{background:{card};padding:2rem;border-radius:12px;border:1px solid {line};width:360px;}}
-  h1{{color:{accent};margin:0 0 0.5rem;font-size:1.4rem;}}
-  p{{color:{muted};margin:0 0 1rem;font-size:.9rem;}}
-  input{{width:100%;padding:10px 14px;margin:0 0 1rem;border:1px solid {line};border-radius:8px;
-         background:{input_bg};color:{text};box-sizing:border-box;font-size:1rem;}}
-  button{{width:100%;padding:10px;background:{accent};color:white;border:none;border-radius:8px;
-          cursor:pointer;font-weight:600;font-size:1rem;}}
-  button:hover{{opacity:.9;}}
-</style></head><body>
-<div class="box">
-  <h1>{html_escape.escape(l['login_heading'])}</h1>
-  <p>{html_escape.escape(l['login_hint'])}</p>
-  {e}
-  <form method="POST" action="/login">
-    <input type="password" name="token" placeholder="ADMIN_TOKEN" autocomplete="off">
-    <button type="submit">{html_escape.escape(l['login_button'])}</button>
-  </form>
-</div>
-</body></html>"""
-
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html_escape.escape(ui['title'])}</title>
+<style>body{{background:{bg};color:{text};font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}}.box{{background:{card};padding:2rem;border-radius:12px;border:1px solid {line};width:360px;}}h1{{color:{accent};margin:0 0 0.5rem;font-size:1.4rem;}}p{{color:{muted};margin:0 0 1rem;font-size:.9rem;}}input{{width:100%;padding:10px 14px;margin:0 0 1rem;border:1px solid {line};border-radius:8px;background:{input_bg};color:{text};box-sizing:border-box;font-size:1rem;}}button{{width:100%;padding:10px;background:{accent};color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:1rem;}}button:hover{{opacity:.9;}}</style></head><body>
+<div class="box"><h1>{html_escape.escape(l['login_heading'])}</h1><p>{html_escape.escape(l['login_hint'])}</p>{e}<form method="POST" action="/login"><input type="password" name="token" placeholder="ADMIN_TOKEN" autocomplete="off"><button type="submit">{html_escape.escape(l['login_button'])}</button></form></div></body></html>"""
 
 # ============================================================
 # РОУТЫ
 # ============================================================
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "relay_ready": _relay_ready.is_set(),
-    })
-
+    return jsonify({"status": "ok"})
 
 @app.route("/")
 def index():
-    _ensure_supervisor_started()
     if not _load_admins():
-        return Response(
-            "<h1 style='font-family:sans-serif;text-align:center;margin-top:4rem'>"
-            "Ни одного ADMIN_TOKEN_* не задано в env</h1>",
-            status=503,
-        )
+        return Response("<h1 style='font-family:sans-serif;text-align:center;margin-top:4rem'>Ни одного ADMIN_TOKEN_* не задано в env</h1>", status=503)
     if not _has_perm("view"):
         return Response(_login_page(), mimetype="text/html")
     return Response(_build_admin_html(), mimetype="text/html")
-
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -528,13 +311,9 @@ def login():
     if token and token in admins:
         resp = Response(status=302)
         resp.headers["Location"] = "/"
-        resp.set_cookie(
-            "admin_token", token,
-            httponly=True, samesite="Strict", secure=True,
-        )
+        resp.set_cookie("admin_token", token, httponly=True, samesite="Strict", secure=True)
         return resp
     return Response(_login_page("Неверный токен"), status=403, mimetype="text/html")
-
 
 @app.route("/logout", methods=["POST"])
 def logout():
@@ -542,7 +321,6 @@ def logout():
     resp.headers["Location"] = "/"
     resp.delete_cookie("admin_token")
     return resp
-
 
 @app.route("/api/status.json")
 def api_status_json():
@@ -556,10 +334,8 @@ def api_status_json():
             cfg = yaml.safe_load(f) or {}
         ui_cfg = cfg.get("ui") or {}
         if isinstance(ui_cfg, dict):
-            if isinstance(ui_cfg.get("timezone"), str):
-                timezone = ui_cfg["timezone"]
-            if isinstance(ui_cfg.get("time_format"), str):
-                time_format = ui_cfg["time_format"]
+            if isinstance(ui_cfg.get("timezone"), str): timezone = ui_cfg["timezone"]
+            if isinstance(ui_cfg.get("time_format"), str): time_format = ui_cfg["time_format"]
     except (FileNotFoundError, yaml.YAMLError):
         pass
 
@@ -570,20 +346,17 @@ def api_status_json():
     data["poll_seconds"] = 10
     return jsonify(data)
 
-
 @app.route("/v1/<path:subpath>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy_v1(subpath):
-    _ensure_supervisor_started()
+    if not TOKENHARBOR_API_KEY:
+        return jsonify({"error": "TOKENHARBOR_API_KEY not set"}), 500
 
-    if not _relay_ready.is_set():
-        if not _relay_ready.wait(timeout=RELAY_READY_WAIT_FOR_CLIENT):
-            return jsonify({"error": "relay not ready, try again shortly"}), 503
-
-    target = f"{RELAY_URL}/v1/{subpath}"
+    target = f"{TOKENHARBOR_BASE}/v1/{subpath}"
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "connection")
     }
+    headers["Authorization"] = f"Bearer {TOKENHARBOR_API_KEY}"
 
     try:
         upstream = requests.request(
@@ -597,7 +370,7 @@ def proxy_v1(subpath):
         )
     except requests.RequestException as exc:
         mark_unresponsive(SERVICE_INDEX)
-        return jsonify({"error": "relay unreachable", "detail": str(exc)}), 502
+        return jsonify({"error": "upstream unreachable", "detail": str(exc)}), 502
 
     mark_started(SERVICE_INDEX)
     mark_recovered(SERVICE_INDEX)
@@ -623,57 +396,19 @@ def proxy_v1(subpath):
         direct_passthrough=True,
     )
 
-
-@app.route("/restart-relay", methods=["POST"])
-def restart_relay_route():
-    if not _has_perm("restart_relay"):
-        return jsonify({"error": "forbidden"}), 403
-    proc = _relay_proc
-    if proc is None:
-        return jsonify({"status": "relay not running"})
-    try:
-        proc.terminate()
-    except OSError:
-        pass
-    return jsonify({"status": "relay termination signaled, supervisor will restart"})
-
-
 @app.route("/restart-all", methods=["POST"])
 def restart_all_route():
     if not _has_perm("restart_all"):
         return jsonify({"error": "forbidden"}), 403
-
-    def _hard_exit():
-        proc = _relay_proc
-        if proc is not None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-        os._exit(0)
-
-    threading.Timer(1.0, _hard_exit).start()
+    threading.Timer(1.0, lambda: os._exit(0)).start()
     return jsonify({"status": "dying"})
-
 
 # ============================================================
 # ЗАПУСК
 # ============================================================
 def _shutdown(signum, frame):
-    print(f"[main] сигнал {signum}, останавливаюсь", flush=True)
     _stop.set()
-    proc = _relay_proc
-    if proc is not None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except OSError:
-                pass
     sys.exit(0)
-
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _shutdown)
@@ -687,7 +422,6 @@ if __name__ == "__main__":
     )
     update_service_override(SERVICE_KEY, SERVICE_NAME, SERVICE_DESCRIPTION)
 
-    _ensure_supervisor_started()
     threading.Thread(target=_self_ping, daemon=True).start()
 
     if waitress_serve is not None:
@@ -696,8 +430,8 @@ if __name__ == "__main__":
             app,
             host="0.0.0.0",
             port=PORT,
-            threads=2,
-            channel_timeout=300,
+            threads=4,            # Увеличили потоки, так как теперь всё в одном процессе
+            channel_timeout=300,  # Даем время на долгие стримы
             cleanup_interval=30,
         )
     else:
