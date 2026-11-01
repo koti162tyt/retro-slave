@@ -1,0 +1,21 @@
+ui:
+  title: "Token Harbor Relay"
+  subtitle: "Статус ретранслятора и админка"
+  theme: "dark"           # dark | light | auto
+  accent_color: "#f63b3b"
+  timezone: "auto"        # auto | UTC | Asia/Kolkata | ...
+  time_format: "24h"      # 12h | 24h
+  sections:
+    status: true
+    controls: true
+    footer: true
+  labels:
+    controls_heading: "⚙️ Управление"
+    restart_relay: "🔄 Перезапустить ретранслятор"
+    hard_restart: "☠️ Жёсткий рестарт"
+    login_heading: "🔐 Вход"
+    login_hint: "Введи токен доступа"
+    login_button: "Войти"
+  footer:
+    copyright: ""
+    links: []
