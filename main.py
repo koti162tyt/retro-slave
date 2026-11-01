@@ -11,6 +11,7 @@ import urllib.error
 import html as html_escape
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -49,9 +50,9 @@ CONF_FILE = Path("conf.yaml")
 
 RELAY_FILE = "relay.py"
 RELAY_HOST = "127.0.0.1"
-RELAY_PORT = int(os.getenv("RELAY_PORT", 8080))
+RELAY_PORT = int(os.getenv("RELAY_PORT", 8888))
 RELAY_URL = f"http://{RELAY_HOST}:{RELAY_PORT}"
-RELAY_READY_TIMEOUT = 20.0
+RELAY_READY_TIMEOUT = 60.0
 RELAY_READY_WAIT_FOR_CLIENT = 15.0
 
 SERVICE_INDEX = 0
@@ -231,16 +232,17 @@ def _wait_relay_ready(timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and not _stop.is_set():
         try:
-            r = requests.get(f"{RELAY_URL}/health", timeout=1.0)
-            if r.status_code == 200:
+            # Используем socket вместо requests, чтобы обойти прокси Render
+            with socket.create_connection((RELAY_HOST, RELAY_PORT), timeout=1.0):
                 return True
-        except requests.RequestException:
+        except (socket.error, ConnectionRefusedError):
             pass
         _stop.wait(0.3)
     return False
 
 
 def _drain_relay_stdout(proc: subprocess.Popen) -> None:
+    print("[supervisor] started draining relay stdout", flush=True)
     try:
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip("\n")
@@ -248,6 +250,7 @@ def _drain_relay_stdout(proc: subprocess.Popen) -> None:
             append_log(SERVICE_INDEX, "stdout", line)
     except Exception as exc:
         print(f"[supervisor] ошибка чтения stdout relay: {exc}", flush=True)
+    print("[supervisor] stopped draining relay stdout", flush=True)
 
 
 def _supervise_relay():
@@ -256,7 +259,7 @@ def _supervise_relay():
     while not _stop.is_set():
         try:
             proc = subprocess.Popen(
-                [sys.executable, RELAY_FILE],
+                [sys.executable, "-u", RELAY_FILE],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -274,12 +277,31 @@ def _supervise_relay():
 
         threading.Thread(target=_drain_relay_stdout, args=(proc,), daemon=True).start()
 
+        # Даем процессу 3 секунды на инициализацию
+        time.sleep(3)
+        
+        # Если процесс уже умер — читаем остатки и выводим код возврата
+        if proc.poll() is not None:
+            print(f"[supervisor] ВНИМАНИЕ: relay.py упал сразу после старта (код {proc.returncode})", flush=True)
+            try:
+                remaining = proc.stdout.read()
+                if remaining:
+                    print(f"[relay-dead] {remaining}", flush=True)
+            except Exception as e:
+                print(f"[supervisor] не смог прочитать stdout: {e}", flush=True)
+            mark_permanently_failed(SERVICE_INDEX, proc.returncode or 1)
+            return
+
+        # Ждем готовности
         if _wait_relay_ready(RELAY_READY_TIMEOUT):
             _relay_ready.set()
             mark_recovered(SERVICE_INDEX)
             print("[supervisor] relay готов принимать запросы", flush=True)
         else:
             print("[supervisor] relay не поднялся за отведённое время", flush=True)
+            if proc.poll() is None:
+                print("[supervisor] процесс жив, но не отвечает на TCP. Убиваем.", flush=True)
+                proc.terminate()
             mark_unresponsive(SERVICE_INDEX)
 
         proc.wait()
@@ -571,6 +593,7 @@ def proxy_v1(subpath):
             data=request.get_data(),
             stream=True,
             timeout=(10, 300),
+            proxies={"http": None, "https": None},
         )
     except requests.RequestException as exc:
         mark_unresponsive(SERVICE_INDEX)
