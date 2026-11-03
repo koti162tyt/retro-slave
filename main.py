@@ -1,10 +1,12 @@
 """
-Админка ретранслятора Token Harbor + статус-страница.
+Админка ретранслятора Token Harbor + Groq + статус-страница.
 Прокси /v1/* работает прямо внутри Flask.
+Маршрутизация: модели с префиксом "groq/" идут в Groq, остальные — в Token Harbor.
 """
 import urllib.request
 import urllib.error
 import html as html_escape
+import json
 import os
 import signal
 import sys
@@ -21,6 +23,7 @@ from status_registry import (
     mark_started,
     mark_recovered,
     mark_unresponsive,
+    mark_clean_exit,
     mark_crashed,
     mark_permanently_failed,
     append_log,
@@ -40,19 +43,33 @@ except ImportError:
 PORT = int(os.getenv("PORT", 8080))
 CONF_FILE = Path("conf.yaml")
 
+# Настройки провайдеров
 TOKENHARBOR_BASE = "https://tokenharbor.ai"
 TOKENHARBOR_API_KEY = os.getenv("TOKENHARBOR_API_KEY", "").strip()
 
+GROQ_BASE = "https://api.groq.com/openai"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+
 SERVICE_INDEX = 0
 SERVICE_KEY = "token-harbor-relay"
-SERVICE_NAME = "Token Harbor Relay"
-SERVICE_DESCRIPTION = "OpenAI-совместимый ретранслятор для Token Harbor"
+SERVICE_NAME = "API Relay (TH + Groq)"
+SERVICE_DESCRIPTION = "OpenAI-совместимый ретранслятор для Token Harbor и Groq"
 
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
 PING_INTERVAL = 600
 
 app = Flask(__name__)
 _stop = threading.Event()
+
+# ============================================================
+# CORS (для доступа из браузера)
+# ============================================================
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
+    return response
 
 # ============================================================
 # РОЛИ И ПРАВА
@@ -95,7 +112,7 @@ def _has_perm(perm: str) -> bool:
 # UI-КОНФИГ
 # ============================================================
 UI_DEFAULTS = {
-    "title": "Token Harbor Relay",
+    "title": "API Relay",
     "subtitle": "Админка и статус ретранслятора",
     "theme": "dark",
     "accent_color": "#f63b3b",
@@ -294,7 +311,13 @@ def _login_page(err: str = "") -> str:
 # ============================================================
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "providers": {
+            "tokenharbor": bool(TOKENHARBOR_API_KEY),
+            "groq": bool(GROQ_API_KEY)
+        }
+    })
 
 @app.route("/")
 def index():
@@ -348,22 +371,58 @@ def api_status_json():
 
 @app.route("/v1/<path:subpath>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy_v1(subpath):
-    if not TOKENHARBOR_API_KEY:
-        return jsonify({"error": "TOKENHARBOR_API_KEY not set"}), 500
+    if request.method == "OPTIONS":
+        return app.make_default_options_response()
 
-    target = f"{TOKENHARBOR_BASE}/v1/{subpath}"
+    # 1. Определяем, куда роутить запрос
+    model = ""
+    req_data = request.get_data()
+    
+    if req_data:
+        try:
+            body = json.loads(req_data)
+            if isinstance(body, dict) and "model" in body:
+                model = body["model"]
+                # Если это Groq, отрезаем префикс "groq/"
+                if model.startswith("groq/"):
+                    body["model"] = model.replace("groq/", "", 1)
+                    req_data = json.dumps(body).encode("utf-8")
+        except Exception:
+            pass
+
+    # 2. Выбираем провайдера и ключ
+    if model.startswith("groq/"):
+        target_base = GROQ_BASE
+        api_key = GROQ_API_KEY
+        provider_name = "Groq"
+    else:
+        target_base = TOKENHARBOR_BASE
+        api_key = TOKENHARBOR_API_KEY
+        provider_name = "Token Harbor"
+
+    if not api_key:
+        return jsonify({"error": f"API key for {provider_name} is not set in environment"}), 500
+
+    # 3. Формируем URL (у Token Harbor /v1, у Groq /openai/v1)
+    if target_base.endswith("/openai"):
+        target_url = f"{target_base}/v1/{subpath}"
+    else:
+        target_url = f"{target_base}/v1/{subpath}"
+
+    # 4. Копируем заголовки и ставим ключ
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "connection")
+        if k.lower() not in ("host", "content-length", "connection", "authorization")
     }
-    headers["Authorization"] = f"Bearer {TOKENHARBOR_API_KEY}"
+    headers["Authorization"] = f"Bearer {api_key}"
 
+    # 5. Отправляем
     try:
         upstream = requests.request(
             method=request.method,
-            url=target,
+            url=target_url,
             headers=headers,
-            data=request.get_data(),
+            data=req_data,
             stream=True,
             timeout=(10, 300),
             proxies={"http": None, "https": None},
@@ -375,6 +434,7 @@ def proxy_v1(subpath):
     mark_started(SERVICE_INDEX)
     mark_recovered(SERVICE_INDEX)
 
+    # 6. Возвращаем стрим
     excluded = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     resp_headers = [
         (k, v) for k, v in upstream.raw.headers.items()
@@ -430,8 +490,8 @@ if __name__ == "__main__":
             app,
             host="0.0.0.0",
             port=PORT,
-            threads=4,            # Увеличили потоки, так как теперь всё в одном процессе
-            channel_timeout=300,  # Даем время на долгие стримы
+            threads=4,
+            channel_timeout=300,
             cleanup_interval=30,
         )
     else:
