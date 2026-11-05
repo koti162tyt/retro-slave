@@ -1,6 +1,7 @@
 """
 Админка ретранслятора Token Harbor + Groq + статус-страница.
 Прокси /v1/* работает прямо внутри Flask.
+Ключи API берутся из заголовка Authorization, отправленного клиентом.
 Маршрутизация: модели с префиксом "groq/" идут в Groq, остальные — в Token Harbor.
 """
 import urllib.request
@@ -43,17 +44,14 @@ except ImportError:
 PORT = int(os.getenv("PORT", 8080))
 CONF_FILE = Path("conf.yaml")
 
-# Настройки провайдеров
+# Базовые URL провайдеров (ключи больше не нужны в env)
 TOKENHARBOR_BASE = "https://tokenharbor.ai"
-TOKENHARBOR_API_KEY = os.getenv("TOKENHARBOR_API_KEY", "").strip()
-
 GROQ_BASE = "https://api.groq.com/openai"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 SERVICE_INDEX = 0
-SERVICE_KEY = "token-harbor-relay"
+SERVICE_KEY = "api-relay"
 SERVICE_NAME = "API Relay (TH + Groq)"
-SERVICE_DESCRIPTION = "OpenAI-совместимый ретранслятор для Token Harbor и Groq"
+SERVICE_DESCRIPTION = "OpenAI-совместимый ретранслятор с клиентскими ключами"
 
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
 PING_INTERVAL = 600
@@ -62,7 +60,7 @@ app = Flask(__name__)
 _stop = threading.Event()
 
 # ============================================================
-# CORS (для доступа из браузера)
+# CORS
 # ============================================================
 @app.after_request
 def add_cors_headers(response):
@@ -311,13 +309,7 @@ def _login_page(err: str = "") -> str:
 # ============================================================
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "providers": {
-            "tokenharbor": bool(TOKENHARBOR_API_KEY),
-            "groq": bool(GROQ_API_KEY)
-        }
-    })
+    return jsonify({"status": "ok"})
 
 @app.route("/")
 def index():
@@ -374,7 +366,16 @@ def proxy_v1(subpath):
     if request.method == "OPTIONS":
         return app.make_default_options_response()
 
-    # 1. Определяем, куда роутить запрос
+    # 1. Получаем ключ из заголовка Authorization
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header. Pass your API key as 'Bearer <your_key>'"}), 401
+    
+    client_api_key = auth_header.split(" ", 1)[1].strip()
+    if not client_api_key:
+        return jsonify({"error": "Empty API key provided"}), 401
+
+    # 2. Определяем маршрут по имени модели
     model = ""
     req_data = request.get_data()
     
@@ -383,40 +384,29 @@ def proxy_v1(subpath):
             body = json.loads(req_data)
             if isinstance(body, dict) and "model" in body:
                 model = body["model"]
-                # Если это Groq, отрезаем префикс "groq/"
                 if model.startswith("groq/"):
                     body["model"] = model.replace("groq/", "", 1)
                     req_data = json.dumps(body).encode("utf-8")
         except Exception:
             pass
 
-    # 2. Выбираем провайдера и ключ
     if model.startswith("groq/"):
         target_base = GROQ_BASE
-        api_key = GROQ_API_KEY
         provider_name = "Groq"
     else:
         target_base = TOKENHARBOR_BASE
-        api_key = TOKENHARBOR_API_KEY
         provider_name = "Token Harbor"
 
-    if not api_key:
-        return jsonify({"error": f"API key for {provider_name} is not set in environment"}), 500
+    target_url = f"{target_base}/v1/{subpath}"
 
-    # 3. Формируем URL (у Token Harbor /v1, у Groq /openai/v1)
-    if target_base.endswith("/openai"):
-        target_url = f"{target_base}/v1/{subpath}"
-    else:
-        target_url = f"{target_base}/v1/{subpath}"
-
-    # 4. Копируем заголовки и ставим ключ
+    # 3. Формируем заголовки с клиентским ключом
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "connection", "authorization")
     }
-    headers["Authorization"] = f"Bearer {api_key}"
+    headers["Authorization"] = f"Bearer {client_api_key}"
 
-    # 5. Отправляем
+    # 4. Отправляем запрос
     try:
         upstream = requests.request(
             method=request.method,
@@ -429,12 +419,12 @@ def proxy_v1(subpath):
         )
     except requests.RequestException as exc:
         mark_unresponsive(SERVICE_INDEX)
-        return jsonify({"error": "upstream unreachable", "detail": str(exc)}), 502
+        return jsonify({"error": f"{provider_name} unreachable", "detail": str(exc)}), 502
 
     mark_started(SERVICE_INDEX)
     mark_recovered(SERVICE_INDEX)
 
-    # 6. Возвращаем стрим
+    # 5. Возвращаем стрим
     excluded = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     resp_headers = [
         (k, v) for k, v in upstream.raw.headers.items()
