@@ -44,7 +44,7 @@ except ImportError:
 PORT = int(os.getenv("PORT", 8080))
 CONF_FILE = Path("conf.yaml")
 
-# Базовые URL провайдеров (ключи больше не нужны в env)
+# Базовые URL провайдеров
 TOKENHARBOR_BASE = "https://tokenharbor.ai"
 GROQ_BASE = "https://api.groq.com/openai"
 
@@ -60,7 +60,7 @@ app = Flask(__name__)
 _stop = threading.Event()
 
 # ============================================================
-# CORS
+# CORS (для доступа из браузера)
 # ============================================================
 @app.after_request
 def add_cors_headers(response):
@@ -399,12 +399,13 @@ def proxy_v1(subpath):
 
     target_url = f"{target_base}/v1/{subpath}"
 
-    # 3. Формируем заголовки с клиентским ключом
+    # 3. Формируем заголовки (убираем accept-encoding, чтобы избежать сжатия)
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "connection", "authorization")
+        if k.lower() not in ("host", "content-length", "connection", "authorization", "accept-encoding")
     }
     headers["Authorization"] = f"Bearer {client_api_key}"
+    headers["Accept-Encoding"] = "identity"  # Запрещаем провайдеру сжимать ответ
 
     # 4. Отправляем запрос
     try:
